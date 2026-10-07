@@ -1,270 +1,103 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import { ElMessage } from "element-plus";
+import TopBar from "./components/TopBar.vue";
+import StatsBar from "./components/StatsBar.vue";
+import ImportPanel from "./components/ImportPanel.vue";
+import WavePanel from "./components/WavePanel.vue";
+import ConflictLedger from "./components/ConflictLedger.vue";
+import StationArchive from "./components/StationArchive.vue";
+import MergeLogPanel from "./components/MergeLogPanel.vue";
+import { useIngestStore } from "./stores/ingest";
+import { createLeaderCoordinator } from "./utils/leader";
+import { SESSION_KEY, STATE_KEY, USERS } from "./data/seed";
+import type { User } from "./types";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const store = useIngestStore();
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+const initialUserId = localStorage.getItem(SESSION_KEY) || USERS[0].id;
+const user = ref<User>(USERS.find((u) => u.id === initialUserId) ?? USERS[0]);
 
-const project = {
-  "number": 21,
-  "folder": "hxwl/frontend/hxwlfront-21",
-  "framework": "vue",
-  "title": "油站网点地图管理",
-  "subtitle": "维护油站位置、营业状态和库存摘要。",
-  "industry": "石油",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Element Plus",
-    "Leaflet"
-  ],
-  "storageKey": "hxwlfront-21-station-map",
-  "formTitle": "新增油站",
-  "primaryAction": "保存油站",
-  "entityLabel": "油站",
-  "statuses": [
-    "营业中",
-    "暂停营业",
-    "库存紧张"
-  ],
-  "filters": [
-    "全部区域",
-    "东区",
-    "西区",
-    "机场线"
-  ],
-  "fields": [
-    {
-      "key": "station",
-      "label": "油站名称"
-    },
-    {
-      "key": "area",
-      "label": "区域",
-      "type": "select",
-      "options": [
-        "东区",
-        "西区",
-        "机场线"
-      ]
-    },
-    {
-      "key": "stock",
-      "label": "库存摘要L",
-      "type": "number"
-    },
-    {
-      "key": "manager",
-      "label": "负责人"
-    }
-  ],
-  "records": [
-    {
-      "station": "东区一站",
-      "area": "东区",
-      "stock": 36000,
-      "manager": "刘站长",
-      "status": "营业中",
-      "notes": "库存正常"
-    },
-    {
-      "station": "机场快线站",
-      "area": "机场线",
-      "stock": 9000,
-      "manager": "王站长",
-      "status": "库存紧张",
-      "notes": "柴油待补"
-    }
-  ],
-  "metricLabels": [
-    "油站数",
-    "营业中",
-    "库存紧张"
-  ]
-} as const;
-
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
-}
-
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
+function switchUser(id: string) {
+  const next = USERS.find((u) => u.id === id);
+  if (next) {
+    user.value = next;
+    localStorage.setItem(SESSION_KEY, next.id);
   }
 }
 
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
-const filter = ref(project.filters[0]);
+// ---- 多标签页写锁 ----
+const coordinator = createLeaderCoordinator(() => {
+  ElMessage.warning("写锁已被其他标签页接管，本页切换为只读");
+});
+const isLeader = coordinator.isLeader;
+const otherLeader = coordinator.leaderOwner;
 
-const filteredRecords = computed(() => {
-  if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
+function takeOver() {
+  // 主动接管：清掉过期/他页锁后重新竞争（非过期锁会在下一心跳纠正）
+  ElMessage.info("已请求接管，若对方心跳过期本页将成为写页");
+  coordinator.stepDown();
+  window.setTimeout(() => coordinator.refreshLeaderInfo(), 0);
+}
+
+function onStorage(event: StorageEvent) {
+  if (event.key === STATE_KEY) store.hydrateFromStorage();
+}
+
+onMounted(() => {
+  coordinator.start();
+  window.addEventListener("storage", onStorage);
+  // 续作：上次遗留的排队批次在写页继续处理
+  window.setTimeout(() => {
+    if (isLeader.value && store.data.batches.some((b) => b.state === "queued")) {
+      void store.runQueue();
+    }
+    if (store.migratedCount > 0) {
+      ElMessage.success(`已将旧版台账中 ${store.migratedCount} 条记录迁移进新台账，并保留迁移来源`);
+    }
+  }, 200);
 });
 
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
+onUnmounted(() => window.removeEventListener("storage", onStorage));
 
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
-
-const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
-
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
-}
-
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
-
-function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
-}
-
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
-}
-
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
-}
+const migrationNotice = computed(() =>
+  store.migratedCount > 0 ? `旧版台账迁移完成：${store.migratedCount} 条记录已入库（见站点档案“旧数据迁移”标记）` : ""
+);
 </script>
 
 <template>
   <main class="app">
     <div class="shell">
-      <header class="topbar">
-        <div>
-          <p class="eyebrow">{{ project.industry }}行业前端最小闭环</p>
-          <h1>{{ project.title }}</h1>
-          <p class="subtitle">{{ project.subtitle }}</p>
-        </div>
-        <div class="stack">
-          <span v-for="item in project.stack" :key="item" class="tag">{{ item }}</span>
-        </div>
-      </header>
+      <TopBar
+        :user="user"
+        :is-leader="isLeader"
+        :other-leader="otherLeader"
+        @switch-user="switchUser"
+        @take-over="takeOver"
+      />
 
-      <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
-        </article>
-      </section>
+      <StatsBar />
 
-      <section class="workspace">
-        <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
-          <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
-              </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
-            </label>
-            <label>
-              备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
-            </label>
-            <button type="submit">{{ project.primaryAction }}</button>
-          </div>
-        </form>
+      <section v-if="migrationNotice" class="migration-banner">{{ migrationNotice }}</section>
 
-        <section class="list-panel">
-          <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
-            </select>
-          </div>
+      <div class="workspace-grid">
+        <ImportPanel :user="user" :is-leader="isLeader" />
+        <WavePanel :user="user" :is-leader="isLeader" />
+      </div>
 
-          <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
-              <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
-              </div>
-              <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
-              </div>
-              <p class="note">{{ record.notes }}</p>
-              <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
-              </div>
-            </article>
-          </div>
+      <ConflictLedger :user="user" :is-leader="isLeader" />
 
-          <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
-              <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
-              <strong>{{ row.value }}</strong>
-            </div>
-          </div>
-        </section>
-      </section>
+      <StationArchive />
+
+      <MergeLogPanel />
+
+      <footer class="footer">
+        <p>
+          流程要点：普通员工只能处理自己站点的状态冲突；批准合并与回滚仅调度员可执行，越权直接拒绝。
+          库存按来源盘点时间取较新者；营业状态未经员工确认前两版并存；冲突站点冻结，波次内两批都完成后解冻并重算统计。
+          导入失败仅重试未成功站点；批次、来源持久化留存；重复导入不新增；旧数据首次打开自动迁移。
+        </p>
+      </footer>
     </div>
   </main>
 </template>
